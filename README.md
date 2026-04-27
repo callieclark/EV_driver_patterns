@@ -13,9 +13,9 @@ Only non-sensitive derived outputs, code, documentation, and optionally small me
 ## Repository structure
 
 ```text
-code/
 
-├── Results notebooks/
+
+├── code/
 │   ├── run.ipynb
 │   ├── EV00_settings.py
 │   ├── EV01_pull_ping_data.ipy	
@@ -47,7 +47,7 @@ code/
 
 ## Notebook workflow
 
-### Processing notebooks
+### Data Pipeline
 
 0. **run.ipynb**
    Runs the entire pipeline from EV01 to EV99. EV00_settings.py installs all dependencies and sets all variables. 
