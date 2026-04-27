@@ -1,0 +1,133 @@
+################################################################################
+# Create user subset  and pull home and work location data from server
+# Created on: 04/01/2025
+# Created by: Callie and Anne
+
+#This script outputs raw/user_freq_stats_{current_city}_{month}.csv' for each month, allowing filtering based on monthly data 
+################################################################################
+
+
+################################################################################
+# prep
+################################################################################
+
+exec(open('EV00_settings.py').read())
+
+
+from shapely.geometry import MultiPolygon
+
+################################################################################
+# functions
+################################################################################
+
+
+
+def filter_ping_data(start_date,end_date, month):
+    """
+    Process the data that is saved by processing date to be by event date, for all counties. 
+    start_date should be string of format "20220130"
+    end_date should be string of format "20220130"
+    """
+    print(f"\t * Start date = {start_date}")
+    print(f"\t * End date  = {end_date}")
+    f_exists=os.path.isfile(data_path+f'raw/user_daily_ping_df_{current_city}_{month}.csv')
+    if f_exists and overwrite==False:
+        visit_count=pd.read_csv(data_path+f'raw/user_daily_ping_df_{current_city}_{month}.csv',index_col=0) 
+        print('DF already Exists for these parameters')
+    else:
+        visit_count = pd.DataFrame()
+    
+        # convert inputs to datetime
+        start_dt = dt.strptime(start_date, '%Y%m%d')
+        end_dt = dt.strptime(end_date, '%Y%m%d')
+
+        # loop through days to pull individually
+        current_date = start_dt
+        while current_date <= end_dt:
+
+            # prep date times
+            date_str = str(current_date.strftime('%Y%m%d'))
+
+            # loop through each of the counties to pull
+            date_start = time.time()
+
+            # check if date already exists, in which case, next date
+
+            # CENTRAL ACTION: filter daily data by ping frequency
+            visit_count=process_day(date_str,visit_count)
+
+            # iterate to next day 
+            print(f"\t *s Finished date {date_str} in {round((time.time()-date_start)/60, 2)} minutes")
+            current_date = current_date + timedelta(days = 1)
+
+        visit_count.to_csv(data_path+f'raw/user_daily_ping_df_{current_city}_{month}.csv')   
+
+        user_freq_df = visit_count.copy()
+        user_freq_df['Days'] = visit_count.count(axis=1)
+        user_freq_df['Avg_points'] = visit_count.mean(axis=1)
+        user_freq_df['Median_points'] = visit_count.median(axis=1)
+        user_freq_df['Days_over_36'] = (visit_count>=36).sum(axis=1)#Every 30 min
+        user_freq_df['Days_over_54'] = (visit_count>=54).sum(axis=1)#Every 7.5
+        user_freq_df['Days_over_72'] = (visit_count>=72).sum(axis=1)#every 15 min
+    
+        user_freq_stats = user_freq_df[['Days','Avg_points', 'Median_points', 
+                                        'Days_over_36', 'Days_over_54', 'Days_over_72']]
+        user_freq_stats.to_csv(data_path+f'raw/user_freq_stats_{current_city}_{month}.csv')  
+        
+        
+    user_freq_stats=pd.read_csv(data_path+f'raw/user_freq_stats_{current_city}_{month}.csv')
+    user_subset = user_freq_stats[(user_freq_stats.Median_points >= min_daily_pings) & 
+                                (user_freq_stats.Days >= minimum_days_incl)].reset_index().copy()
+    user_subset_ls = list(user_subset.cuebiq_id)
+
+    with open(f'{data_path}ping{min_daily_pings}/user_subset/user_subset_{current_city}_{month}.txt', 'w') as file:
+        file.write('\n'.join(map(str, user_subset_ls)))
+
+
+        
+
+def process_day(date_str,visit_count):
+    
+    pings = pd.read_parquet(data_path+f'raw/ping/event_date/ping_data_{current_city}_{date_str}.parquet')
+     
+    # calculate total daily pings per user
+    temp_count = pings.groupby('cuebiq_id').agg({'event_zoned_datetime': 'count'})
+    temp_count.rename(columns={'event_zoned_datetime': f'{date_str}'}, inplace=True)
+
+    
+    print(f"-----------------------------------------------------------------------------\nProcessing date: {date_str}")
+    if visit_count.empty:
+        visit_count = temp_count
+        visit_count.index=visit_count.index.astype('int')
+    else:
+        temp_count.index=temp_count.index.astype('int')
+        visit_count = visit_count.merge(temp_count, how='outer', left_index=True, right_index=True)
+    del temp_count
+    
+   
+
+    
+    return visit_count
+       
+################################################################################
+# run
+################################################################################
+
+    
+# print some info before starting
+print("\n\n-----------------------------------------------------------------------------\nSettings:")
+print(f"\t * overwrite = {overwrite}")
+
+
+
+
+
+# -------------------------------------------------------------------------------
+# run this file
+filter_ping_data("20220301","20220331",3)
+filter_ping_data("20220401","20220430",4)
+filter_ping_data("20220501","20220531",5)
+
+# filter_ping_data("20220101","20220131",1)
+# filter_ping_data("20220201","20220228",2)
+# filter_ping_data("20220301","20220331",3)

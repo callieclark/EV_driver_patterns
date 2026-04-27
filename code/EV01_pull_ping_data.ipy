@@ -1,0 +1,238 @@
+################################################################################
+# Pull ping data from server
+# Created on: 03/14/2025
+# Created by: Callie and Anne
+################################################################################
+
+
+################################################################################
+# prep
+################################################################################
+
+# bring in all settings
+exec(open('EV00_settings.py').read())
+
+%load_ext cuebiqmagic.magics
+%init_cuebiq_data
+snow_engine = get_ipython().user_ns['instance']
+
+
+################################################################################
+# functions
+################################################################################
+
+def calculate_distance_fast(lat1, lon1, lat2, lon2):
+    """
+    Calculate approximate distance using equirectangular projection.
+    Much faster than Haversine but less accurate, especially at higher latitudes.
+    Good for shorter distances (city/regional scale).
+    
+    Returns distance in meters
+    """
+    
+    # Convert to radians
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    
+    # Calculate differences
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1) * np.cos((lat1_rad + lat2_rad) / 2)
+    
+    # Earth's radius in meters
+    R = 6371000
+    
+    # Calculate distance
+    distance = R * np.sqrt(dlat**2 + dlon**2)
+    
+    return distance
+
+
+def calculate_speeds(df):
+    """
+    Calculate speeds for multiple users in a dataframe using fast distance calculation.
+    Assumes df has columns: cuebiq_id, lat, lng, event_zoned_datetime
+    """
+
+    # Split users into chunks
+    df['event_zoned_datetime'] = pd.to_datetime(df['event_zoned_datetime'], errors='coerce', utc=True)
+    df = df.dropna(subset=['event_zoned_datetime'])
+
+    df = df.sort_values(['cuebiq_id', 'event_zoned_datetime'])
+
+    # Initialize arrays
+    df['distance_m'] = np.nan
+    df['speed_kmh'] = np.nan
+
+    # Calculate for each user
+    for user_id in df['cuebiq_id'].unique():
+        user_mask = df['cuebiq_id'] == user_id
+        user_data = df.loc[user_mask].copy()
+
+        if len(user_data) > 1:
+            # Vectorized distance calculation
+            lats = user_data['lat'].values
+            lons = user_data['lng'].values
+            distances = calculate_distance_fast(
+                lats[:-1], lons[:-1],
+                lats[1:], lons[1:]
+            )
+
+            # Calculate time differences
+            time_diffs = user_data['event_zoned_datetime'].diff().dt.total_seconds() / 3600
+            
+            # For areas with time diff = 0, set speed to 0 not inf
+            speeds = np.where(time_diffs.iloc[1:] > 0, (distances / 1000) / time_diffs.iloc[1:], 0) 
+
+            df.loc[user_data.index[1:], 'distance_m'] = distances
+            df.loc[user_data.index[1:], 'speed_kmh'] = speeds
+            
+            df.loc[user_data.index[0], 'distance_m'] = 0 #assume first point of day is from where they sleep
+            df.loc[user_data.index[0], 'speed_kmh'] = 0 #assume they start at home 
+
+    return df
+
+
+def getrawdata(thisdate, county_code):
+    """
+    Pull the raw data for a given date and one county. 
+    thisdate should be an integer of the format 20220128
+    county_code should be a US county code of the format 'US.CA.097'
+    """
+    
+    # get processing dates    
+    thisdate = int(thisdate)
+    processing_enddate = dt.strptime(str(thisdate), "%Y%m%d") + timedelta(days = processing_days)
+    processing_dates = pd.date_range(dt.strptime(str(thisdate), "%Y%m%d"), processing_enddate, freq='d')
+    processing_dates = [dt.strftime(x, "%Y%m%d") for x in processing_dates]
+
+    # pull the data!!!
+    q = snow_engine.read_sql(
+       
+        f"""
+        select
+            cuebiq_id,
+            lat,
+            lng,
+            accuracy_meters,
+            admin2_id,
+            event_zoned_datetime,
+            speed_ms,
+        from {pings_table}
+        where 
+            country_code = 'US'
+            and admin1_id = '{county_code[0:5]}'
+            and processing_date = {thisdate}
+            and admin2_id = '{county_code}'
+            and provider_id IN ('LIMA', 'SIERRA', 'WHISKEY')
+            """
+    )
+
+    # return the data
+    return q
+
+def download_and_save_data():
+    """
+    Download and save the data to our data system maintained on this server. 
+    start_date should be string of format "20220130"
+    end_date should be string of format "20220130"
+    """
+    
+    # convert inputs to datetime
+    start_dt = dt.strptime(start_date, '%Y%m%d')
+    end_dt = dt.strptime(end_date, '%Y%m%d')
+
+    # loop through days to pull individually
+    current_date = start_dt
+    while current_date <= end_dt:
+        
+        # prep date times
+        date_str = str(current_date.strftime('%Y%m%d'))
+        date_start = time.time()
+        
+        # check if all counties have been processed, in which case, next date
+        # file_convention = re.compile(f'ping_data_.+_processed{date_str}.+\.csv\.gz')
+        # matches = [f for f in os.listdir(data_path+'raw/ping/process_date/') if file_convention.match(f)]
+        # if len(matches) == (processing_days+1)*len(counties) and not overwrite: 
+        #     print(f"---------- Date {date_str} has already been processed, skipping at {cur_time_string()}")
+        #     current_date = current_date + timedelta(days = 1)
+        #     continue
+          
+        # print alert of what day is being processed
+        print(f"-----------------------------------------------------------------------------\nProcessing date: {date_str}")
+        
+        for county in counties:
+            
+            # check if specific county has been processed, in which case, next date
+            file_convention = re.compile(f'ping_data_{county}_processed{date_str}.+\.csv\.gz')
+            matches = [f for f in os.listdir(data_path+'raw/ping/process_date/') if file_convention.match(f)]
+            if len(matches) == (processing_days+1) and not overwrite: 
+                print(f"\t * County {county} has already been processed, skipping at {cur_time_string()}")
+                continue
+            
+            start = time.time()
+            # print alert of what county is being processed
+            print(f"\t * Started Counties {county} at {cur_time_string()}")
+
+            # CENTRAL ACTION: pull data, calculate speed
+            daily_data = getrawdata(date_str, county)
+            if debug: print(f"\t\t\t * RAW DATA: Counties {county} on event date {date_str} has {len(daily_data):,} rows") 
+            daily_data = calculate_speeds(daily_data)
+            
+            # prep to save out for the event dates of interest
+            processing_enddate = dt.strptime(date_str, "%Y%m%d") - timedelta(days = processing_days)
+            processing_dates = pd.date_range(processing_enddate, dt.strptime(str(date_str), "%Y%m%d"), freq='d')
+            processing_dates = [dt.strftime(x, "%Y-%m-%d") for x in processing_dates]
+           
+            # CENTRAL ACTION: save out each event_date
+            for event_date in processing_dates:
+                file_name = f'ping_data_{county}_processed{date_str}_event{event_date.replace("-", "")}.csv.gz' 
+                file_path = data_path + 'raw/ping/process_date/' + file_name
+                event_date_data = daily_data[daily_data.event_zoned_datetime.astype(str).str[:10] == event_date]
+                event_date_data.to_csv(file_path, index=False, compression='gzip')
+                print(f"\t\t\t * Saved Counties {county} on event date {event_date} at {round((time.time()-start)/60, 2)} minutes in")
+                print(f"\t\t\t * Counties {county} on event date {event_date} has {len(event_date_data):,} rows")      
+            
+            # print info on county processing
+            print(f"\t\t * Counties {county} have {len(daily_data):,} rows")
+            del daily_data
+            print(f"\t\t * Finished Counties {county} in {round((time.time()-start)/60, 2)} minutes")
+            
+        # iterate to next day 
+        print(f"\t * Finished date {date_str} in {round((time.time()-date_start)/60, 2)} minutes")
+        current_date = current_date + timedelta(days = 1)
+
+        
+################################################################################
+# run
+################################################################################
+
+# pull "processing days" more days since u need the later days to process the last day
+end_date = dt.strptime(end_date, '%Y%m%d') + timedelta(days = processing_days+1)
+end_date = str(end_date.strftime('%Y%m%d'))
+
+# print some info before starting
+print("\n\n-----------------------------------------------------------------------------\nSettings:")
+print(f"\t * overwrite = {overwrite}")
+print(f"\t * Start date = {start_date}")
+print(f"\t * End date = {end_date}")
+print(f"\t * # of days to include in query for when data is processed = {processing_days}")
+print(f"\t * included counties = {counties}\n\n")
+
+
+# run this file
+download_and_save_data()
+
+
+# get list of dates to run for using the start and end date
+#start_dt = dt.strptime(start_date, '%Y%m%d')
+#end_dt = dt.strptime(end_date, '%Y%m%d')
+#date_list = pd.date_range(start=start_dt, end=end_dt).tolist()
+#date_list = [str(x.strftime('%Y%m%d')) for x in date_list]
+
+# create the set of arguments the function should be run for
+#start_dates = date_list
+#end_dates = date_list
+#arg_instances = [(start_date, end_date, data_path, counties) for start_date, end_date in zip(start_dates, end_dates)]  
+
+# run in parallel
+#Parallel(n_jobs=4)(delayed(download_and_save_data)(arg1, arg2, arg3, arg4) for arg1, arg2, arg3, arg4 in arg_instances)

@@ -1,0 +1,189 @@
+################################################################################
+# Pull stop data from server
+# Created on: 03/16/2025
+# Created by: Callie and Anne
+################################################################################
+
+
+################################################################################
+# prep
+################################################################################
+
+# bring in all settings
+exec(open('EV00_settings.py').read())
+
+%load_ext cuebiqmagic.magics
+%init_cuebiq_data
+snow_engine = get_ipython().user_ns['instance']
+
+# name of table to import from
+stop_table = f"{schema_name['cda']}.stop_uplevelled"  
+
+
+################################################################################
+# functions
+################################################################################
+
+def calculate_distance_fast(lat1, lon1, lat2, lon2):
+    """
+    Calculate approximate distance using equirectangular projection.
+    Much faster than Haversine but less accurate, especially at higher latitudes.
+    Good for shorter distances (city/regional scale).
+    
+    Returns distance in meters
+    """
+    
+    # Convert to radians
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    
+    # Calculate differences
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1) * np.cos((lat1_rad + lat2_rad) / 2)
+    
+    # Earth's radius in meters
+    R = 6371000
+    
+    # Calculate distance
+    distance = R * np.sqrt(dlat**2 + dlon**2)
+    
+    return distance
+
+
+def calculate_speeds(df):
+    """
+    Calculate speeds for multiple users in a dataframe using fast distance calculation.
+    Assumes df has columns: cuebiq_id, latitude, longitude, event_zoned_datetime
+    """
+
+    # Split users into chunks
+    df['event_zoned_datetime'] = pd.to_datetime(df['event_zoned_datetime'], errors='coerce', utc=True)
+    df = df.dropna(subset=['event_zoned_datetime'])
+
+    df = df.sort_values(['cuebiq_id', 'event_zoned_datetime'])
+
+    # Initialize arrays
+    df['distance_m'] = np.nan
+    df['speed_kmh'] = np.nan
+
+    # Calculate for each user
+    for user_id in df['cuebiq_id'].unique():
+        user_mask = df['cuebiq_id'] == user_id
+        user_data = df.loc[user_mask].copy()
+
+        if len(user_data) > 1:
+            # Vectorized distance calculation
+            lats = user_data['lat'].values
+            lons = user_data['lng'].values
+            distances = calculate_distance_fast(
+                lats[:-1], lons[:-1],
+                lats[1:], lons[1:]
+            )
+
+            # Calculate time differences
+            time_diffs = user_data['event_zoned_datetime'].diff().dt.total_seconds() / 3600
+            
+            # For areas with time diff = 0, set speed to 0 not inf
+            speeds = np.where(time_diffs.iloc[1:] > 0, (distances / 1000) / time_diffs.iloc[1:], 0) 
+
+            df.loc[user_data.index[1:], 'distance_m'] = distances
+            df.loc[user_data.index[1:], 'speed_kmh'] = speeds
+            
+            df.loc[user_data.index[0], 'distance_m'] = 0 #assume first point of day is from where they sleep
+            df.loc[user_data.index[0], 'speed_kmh'] = 0 #assume they start at home 
+
+    return df
+
+
+def getstopsdata(thisdate):
+    """
+    Pull the stops data for a given date and all counties. 
+    thisdate should be an integer of the format 20220128
+    counties should be a list of US county codes of the format 'US.CA.097'
+    """
+    
+    # convert to int
+    thisdate = int(thisdate)
+    proc_enddate = dt.strptime(str(thisdate), "%Y%m%d") + timedelta(days = processing_days)
+    proc_enddate = int(dt.strftime(proc_enddate, "%Y%m%d"))
+
+    q = snow_engine.read_sql(
+        f"""
+        select
+            cuebiq_id,
+            lat,
+            lng,
+            admin2_id,
+            stop_zoned_datetime,
+            dwell_time_minutes,
+            classification_type,
+            transformation_type,
+            block_group_id
+        from {stop_table}
+        where
+            processing_date between {thisdate} and {proc_enddate}
+            and cast(replace(substr(stop_zoned_datetime, 1, 10), '-', '') as integer) = {thisdate}
+            and admin2_id in ({"'" + "', '".join(counties) + "'"})
+        """
+    )
+
+    return q 
+
+
+def download_and_save_data():
+    """
+    Download and save the data to our data system maintained on this server. 
+    start_date should be string of format "20220130"
+    end_date should be string of format "20220130"
+    """
+
+    # convert inputs to datetime
+    start_dt = dt.strptime(start_date, '%Y%m%d')
+    end_dt = dt.strptime(end_date, '%Y%m%d')
+
+    # loop through days to pull individually
+    current_date = start_dt
+    while current_date <= end_dt:
+        
+        # prep date times
+        date_str = str(current_date.strftime('%Y%m%d'))
+        
+        # check if you've already processed this date
+        date_exists = os.path.exists(f"{data_path}raw/stop/stop_data_{current_city}_{date_str}.csv.gz")
+        if date_exists and not overwrite:
+            print(f"---------- Date {date_str} has already been processed, skipping at {cur_time_string()}")
+            current_date = current_date + timedelta(days = 1)
+            continue
+        
+        # print alert of what day is being processed
+        date_str = str(current_date.strftime('%Y%m%d'))
+        print(f"-----------------------------------------------------------------------------\nProcessing date: {date_str}")
+        
+        # CENTRAL ACTION: pull data, save out
+        start = time.time()
+        daily_data = getstopsdata(date_str)
+        daily_data.to_csv(f"{data_path}raw/stop/stop_data_{current_city}_{date_str}.csv.gz", index=False, compression='gzip')
+
+        # print info on county processing
+        print(f"\t* Date {date_str} has {len(daily_data)} rows")
+        del daily_data
+        print(f"\t* Finished Date {date_str} in {round((time.time()-start)/60, 2)} minutes")
+        print(f"\tData saved to {data_path+'stop'} at  {cur_time_string()}")
+        
+        # iterate to next day 
+        current_date = current_date + timedelta(days = 1)
+    
+################################################################################
+# run
+################################################################################
+
+# print some info before starting
+print("\n\n-----------------------------------------------------------------------------\nSettings:")
+print(f"\t * overwrite = {overwrite}")
+print(f"\t * Start date = {start_date}")
+print(f"\t * End date = {end_date}")
+print(f"\t * # of days to include in query for when data is processed = {processing_days}")
+print(f"\t * included counties = {counties}\n\n")
+    
+    
+download_and_save_data()

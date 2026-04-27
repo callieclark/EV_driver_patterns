@@ -1,0 +1,194 @@
+################################################################################
+# Create user subset  and pull home and work location data from server
+# Created on: 04/01/2025
+# Created by: Callie and Anne
+
+#This script creates one home-work map for all the users over the entire study period
+################################################################################
+
+
+################################################################################
+# prep
+################################################################################
+
+exec(open('EV00_settings.py').read())
+
+%load_ext cuebiqmagic.magics
+%init_cuebiq_data
+snow_engine = get_ipython().user_ns['instance']
+
+from shapely.geometry import MultiPolygon
+
+################################################################################
+# functions
+################################################################################
+
+def pull_home_work_locations(uid_list_str, date_str):
+    """
+    For all users in UID list checks if home location is within the study area.
+    Returns a df with the Home and Work cbgs of all UIDs within study area. 
+    Also reformats to 2020 GEOID's (from 2010)
+    """
+    
+    # pull home and work locations from spectus
+    q = query_hw(uid_list_str, date_str)
+
+    # convert from provided 2010 GEOIDs to 2020 
+    q['GEOID_2010'] = q['block_group_id'].apply(reformat_block_group_id_to_geoid)
+    q.loc[:,'GEOID'] = q.GEOID_2010.map(mapping_dict)
+
+    # pull out home and work locations
+    df_home = q[q.tag_type_code == 'HOME']
+    df_home = df_home.drop_duplicates()
+    df_work = q[q.tag_type_code == 'WORK']
+    df_work = df_work.drop_duplicates()
+    del q
+
+    # merge into single table with one row per user
+    df_hw = df_home.merge(df_work, left_on='cuebiq_id', right_on='cuebiq_id', suffixes=('_H','_W'), how ='left')
+
+    
+    # keep the home we are most confident about for each person
+    #df_hw = df_hw.sort_values('confidence_level_H').groupby('cuebiq_id').nth(0).reset_index() # NEW
+    #    we used to use the mode when we pulled every day and aggregated
+    #    df_hw = df_hw.groupby('cuebiq_id')[['GEOID_H', 'GEOID_W']].agg(lambda x: get_first(pd.Series.mode(x))).reset_index() #first if there r mult modes
+    
+    # remove users without home locations
+    df_hw=df_hw.dropna(subset = ['cuebiq_id', 'GEOID_H'], how='any') 
+    
+    # remove users with home locations outside of area
+    #users_within = df_hw[df_hw['GEOID_H'].isin(cbg_study_area.GEOID)]   
+    users_within = df_hw[['cuebiq_id', 'GEOID_H', 'GEOID_W', 'confidence_level_H', 'confidence_level_W']]
+    del df_hw
+    
+    return users_within
+
+
+def process_day(date_str,month):
+    """        
+    For a specific day, reads in all files, filters users by minimum daily pings, saves filtered df
+    """
+    #check for file
+    
+    # start timer
+    date_start = time.time()
+
+    with open(f'{data_path}ping{min_daily_pings}/user_subset/user_subset_{current_city}_{month}.txt', 'r') as file:
+        uid_list = [line.strip() for line in file.readlines()]
+    
+    # create df to fill
+    home_work_locations = pd.DataFrame()
+
+    # iterate over the ids we need to pull for 
+    i=0
+    j=150000
+    while i <= len(uid_list):
+        
+        # transform list to a string
+        uid_list_str = ", ".join([f"'{uid}'" for uid in uid_list[i:j]])
+        
+        # pull home work locations
+        home_work_iter = pull_home_work_locations(uid_list_str, date_str) 
+
+        print(f"\t * Returned home + work locations by {round((time.time()-date_start)/60, 2)} minutes")
+        
+        # add to the df and iterate
+        home_work_locations = pd.concat([home_work_locations, home_work_iter])
+        i+=150000
+        j+=150000
+        
+    home_work_locations.to_csv(data_path + f"ping{min_daily_pings}/user_home_work/user_home_work_{current_city}_{date_str}.csv", index=False)
+    
+    return home_work_locations
+
+    
+
+    
+def filter_ping_data():
+    """
+    Process the data that is saved by processing date to be by event date, for all counties. 
+    start_date should be string of format "20220130"
+    end_date should be string of format "20220130"
+    """
+    home_work_locations_all=pd.DataFrame()
+    # convert inputs to datetime
+    start_dt = dt.strptime(start_date, '%Y%m%d')
+    end_dt = dt.strptime(end_date, '%Y%m%d')
+
+    # loop through days to pull individually
+    current_date = start_dt
+    while current_date <= end_dt:
+        month=current_date.month
+        
+        # prep date times
+        date_str = str(current_date.strftime('%Y%m%d'))
+        
+        # loop through each of the counties to pull
+        date_start = time.time()
+        
+        # print alert of what day is being processed
+        print(f"---------------------------------------------------------------\nProcessing date: {date_str},{month}")
+        f_exists=os.path.isfile(data_path + f"ping{min_daily_pings}/user_home_work/user_home_work_{current_city}_{date_str}.csv")
+                      
+        if not f_exists or overwrite: 
+
+            # CENTRAL ACTION: filter daily data by ping frequency
+            home_work_locations = process_day(date_str, month)
+
+        else:
+            home_work_locations = pd.read_csv(data_path + f"ping{min_daily_pings}/user_home_work/user_home_work_{current_city}_{date_str}.csv", index_col=0)
+        home_work_locations_all = pd.concat([home_work_locations_all,home_work_locations])
+                                
+        # iterate to next day 
+        print(f"\t * Finished date {date_str} in {round((time.time()-date_start)/60, 2)} minutes")
+        current_date = current_date + timedelta(days = 1)
+        
+        
+            
+    
+    mode_df = (
+    home_work_locations_all
+    .groupby('cuebiq_id')[['GEOID_H', 'GEOID_W']]
+    .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else np.nan)
+    .reset_index())
+    
+    #remove users with home locations outside of area
+    mode_df.GEOID_H = mode_df.GEOID_H.astype(str)
+    cbg_study_area.GEOID = cbg_study_area.GEOID.astype(str)
+    mode_df = mode_df[mode_df['GEOID_H'].isin(cbg_study_area.GEOID)] 
+    
+    mode_df.to_csv(data_path + f"ping{min_daily_pings}/user_home_work/user_home_work_{current_city}.csv", index=False)
+     
+    
+        
+
+
+
+          
+################################################################################
+# run
+################################################################################
+
+    
+# print some info before starting
+print("\n\n-----------------------------------------------------------------------------\nSettings:")
+print(f"\t * overwrite = {overwrite}")
+print(f"\t * Start date = {start_date}")
+print(f"\t * End date  = {end_date}")
+print(f"\t * Minimum number daily pings = {min_daily_pings}\n\n")
+    
+
+    
+# read in study area
+cbg_study_area = gpd.read_file(root+f'data/geo_files/{current_city}/studyarea_cbg.shp')
+
+
+# create mapping dictionary for 2010 to 2020 block group mapping
+crosswalk = pd.read_csv(root+'/data/census/df_bg2010_to_bg2020_maj_area.csv')
+crosswalk.loc[:,'bg2020ge'] = crosswalk.bg2020ge.astype(str).str.zfill(12)
+crosswalk.loc[:,'bg2010ge'] = crosswalk.bg2010ge.astype(str).str.zfill(12)
+mapping_dict = dict(zip(crosswalk['bg2010ge'], crosswalk['bg2020ge']))
+
+# -------------------------------------------------------------------------------
+# run this file
+filter_ping_data()
